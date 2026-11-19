@@ -1,5 +1,5 @@
 /* Fitness offline — service worker: appka jde otevřít bez internetu. */
-const CACHE='fitness-offline-v2';
+const CACHE='fitness-offline-v3';
 const CORE=['./','./index.html','./manifest.webmanifest','./icon-192.png','./icon-512.png'];
 const FONT_CSS='https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@500;600;700&display=swap';
 async function cacheFonts(c){

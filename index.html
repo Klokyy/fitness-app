@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fitness offline</title>
+<title>Fitness</title>
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#0e7468">
 <link rel="icon" href="icon-192.png">
@@ -123,7 +123,7 @@ a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
 .txt{white-space:pre-wrap;overflow-wrap:anywhere}
 .txt-blocks{display:grid;gap:12px}
 @media (min-width:700px){.txt-blocks{grid-template-columns:repeat(3,1fr)}}
-textarea,input[type=text],input[type=number],select{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:9px 10px;width:100%}
+textarea,input[type=text],input[type=number],input[type=password],select{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:9px 10px;width:100%}
 textarea{min-height:76px;resize:vertical}
 
 .pad{position:fixed;left:0;right:0;bottom:0;z-index:30;background:var(--surface);border-top:2px solid var(--ink);padding:10px 12px 14px;display:flex;flex-direction:column;gap:10px;box-shadow:0 -8px 24px rgba(0,0,0,.18)}
@@ -198,28 +198,136 @@ pre{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;background:
 <nav class="tabs nav-bottom" aria-label="Pohledy"></nav>
 <div id="pad"></div>
 <script>
-/* Offline verze: data jen v tomto telefonu (localStorage). Stejné rozhraní jako úložiště appky. */
+/* Offline verze s automatickou synchronizací: data v zařízení (localStorage) + soukromý repozitář GitHub (fitness-data). */
 window.FITNESS_LOCAL=true;
 (function(){
-  var KEY='fitness-local-db-v1', store={};
+  var KEY='fitness-local-db-v1', MKEY='fitness-sync-v1', TKEY='fitness-gh-token';
+  var REPO={owner:'Klokyy',repo:'fitness-data',branch:'main'};
+  var API=(function(){try{return localStorage.getItem('fitness-gh-api')||'https://api.github.com';}catch(e){return 'https://api.github.com';}})();
+  var DEVICE=/Android|iPhone|Mobile/i.test(navigator.userAgent)?'mobil':'PC';
+  var store={}, meta={};
   try{store=JSON.parse(localStorage.getItem(KEY)||'{}')||{};}catch(e){store={};}
+  try{meta=JSON.parse(localStorage.getItem(MKEY)||'{}')||{};}catch(e){meta={};}
   ['weeks','logs','ref'].forEach(function(c){store[c]=store[c]||{};});
-  var subs=[];
-  function save(){try{localStorage.setItem(KEY,JSON.stringify(store));}catch(e){}}
+  meta.sha=meta.sha||{}; meta.dirty=meta.dirty||{}; meta.seq=meta.seq||0; meta.base=meta.base||{};
+  function pushable(k){return /^(weeks|logs)\//.test(k);}
+  if(!meta.inited){ /* první spuštění se synchronizací: co už je v zařízení, porovná se s GitHubem podle updatedAt */
+    ['weeks','logs'].forEach(function(c){Object.keys(store[c]).forEach(function(i){meta.dirty[c+'/'+i]=++meta.seq;});});
+    meta.inited=true;
+  }
+  var subs=[], state='idle', running=false, again=false, tries=0, timer=null;
+  function saveAll(){try{localStorage.setItem(KEY,JSON.stringify(store));localStorage.setItem(MKEY,JSON.stringify(meta));}catch(e){}}
+  saveAll();
   function cl(o){return JSON.parse(JSON.stringify(o));}
   function ds(c,i){var d=store[c]&&store[c][i];return {id:i,exists:!!d,data:function(){return d?cl(d):undefined;},metadata:{fromCache:false,hasPendingWrites:false}};}
   function cs(c){var ids=Object.keys(store[c]||{}).sort();return {docs:ids.map(function(i){return ds(c,i);}),size:ids.length,empty:!ids.length,metadata:{fromCache:false,hasPendingWrites:false}};}
   function fire(){subs.forEach(function(f){setTimeout(f,0);});}
+  function getToken(){try{return localStorage.getItem(TKEY)||'';}catch(e){return '';}}
+  function enc(s){var b=new TextEncoder().encode(s),bin='';for(var i=0;i<b.length;i+=0x8000)bin+=String.fromCharCode.apply(null,b.subarray(i,i+0x8000));return btoa(bin);}
+  function dec(b64){var bin=atob(String(b64).replace(/\s/g,'')),u=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return new TextDecoder().decode(u);}
+  /* 3cestné slučování: base = poslední verze shodná s GitHubem. Změny z obou zařízení se spojí po polích;
+     když se stejné pole změnilo na obou, vyhraje novější updatedAt. */
+  function stable(x){if(Array.isArray(x)) return '['+x.map(stable).join(',')+']';
+    if(x&&typeof x==='object') return '{'+Object.keys(x).sort().map(function(k){return JSON.stringify(k)+':'+stable(x[k]);}).join(',')+'}';
+    return JSON.stringify(x===undefined?null:x);}
+  function eq(a,b){return stable(a)===stable(b);}
+  function isObj(x){return x&&typeof x==='object'&&!Array.isArray(x);}
+  function m3(b,l,r,lw){
+    if(eq(l,r)) return l; if(eq(b,l)) return r; if(eq(b,r)) return l;
+    if(isObj(l)&&isObj(r)&&(b===undefined||isObj(b))){var o={},bb=b||{},ks={};
+      Object.keys(l).concat(Object.keys(r)).forEach(function(k){ks[k]=1;});
+      Object.keys(ks).forEach(function(k){var v=m3(bb[k],l[k],r[k],lw); if(v!==undefined) o[k]=v;}); return o;}
+    if(Array.isArray(l)&&Array.isArray(r)&&Array.isArray(b)&&l.length===r.length&&r.length===b.length){
+      return l.map(function(x,i){return m3(b[i],x,r[i],lw);});}
+    return lw?l:r;
+  }
+  function merge(base,loc,rem){
+    var lw=(loc.updatedAt||0)>(rem.updatedAt||0);
+    if(base===undefined) return lw?loc:rem;
+    var o=m3(base,loc,rem,lw); o.updatedAt=Math.max(loc.updatedAt||0,rem.updatedAt||0); return o;
+  }
+  async function gh(method,path,body){
+    var res=await fetch(API+'/repos/'+REPO.owner+'/'+REPO.repo+path,{method:method,cache:'no-store',
+      headers:{'Authorization':'Bearer '+getToken(),'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},
+      body:body?JSON.stringify(body):undefined});
+    var j=null; try{j=await res.json();}catch(e){}
+    return {status:res.status,json:j};
+  }
+  function fail(r,what){var e=new Error(what+': HTTP '+r.status+(r.json&&r.json.message?' — '+r.json.message:''));e.status=r.status;return e;}
+  async function syncNow(){
+    if(running){again=true;return;}
+    if(!getToken()){state='notoken';fire();return;}
+    if(navigator.onLine===false){state='offline';fire();return;}
+    running=true; state='syncing'; fire();
+    try{
+      var remote={}, t=await gh('GET','/git/trees/'+REPO.branch+'?recursive=1');
+      if(t.status===200){(t.json.tree||[]).forEach(function(x){var m=x.type==='blob'&&x.path.match(/^((weeks|logs|ref)\/[^\/]+)\.json$/); if(m) remote[m[1]]=x.sha;});}
+      else if(t.status!==404&&t.status!==409) throw fail(t,'Načtení repozitáře');
+      var changed=false, keys=Object.keys(remote);
+      for(var n=0;n<keys.length;n++){
+        var k=keys[n]; if(meta.sha[k]===remote[k]) continue;
+        var b=await gh('GET','/git/blobs/'+remote[k]); if(b.status!==200) throw fail(b,'Načtení '+k);
+        var obj=JSON.parse(dec(b.json.content)), p=k.split('/'), c=p[0], id=p[1], loc=store[c][id];
+        if(meta.dirty[k]&&loc){
+          var mg=merge(meta.base[k],loc,obj);
+          meta.sha[k]=remote[k]; meta.base[k]=obj;
+          if(eq(mg,obj)){store[c][id]=obj; delete meta.dirty[k];} else store[c][id]=mg;
+          changed=true;
+        } else { store[c][id]=obj; meta.sha[k]=remote[k]; meta.base[k]=obj; delete meta.dirty[k]; changed=true; }
+      }
+      saveAll(); if(changed) fire();
+      var dk=Object.keys(meta.dirty);
+      for(var m=0;m<dk.length;m++){
+        var kk=dk[m]; if(!pushable(kk)){delete meta.dirty[kk];continue;}
+        var seq=meta.dirty[kk], pp=kk.split('/'), doc=store[pp[0]][pp[1]];
+        if(!doc){delete meta.dirty[kk];continue;}
+        var body={message:'appka ('+DEVICE+'): '+kk,content:enc(JSON.stringify(doc,null,1)+'\n'),branch:REPO.branch};
+        if(meta.sha[kk]) body.sha=meta.sha[kk];
+        var r=await gh('PUT','/contents/'+kk+'.json',body);
+        if(r.status===200||r.status===201){meta.sha[kk]=r.json.content.sha; meta.base[kk]=cl(doc); if(meta.dirty[kk]===seq) delete meta.dirty[kk]; saveAll();}
+        else if(r.status===409||r.status===422){again=true;}
+        else throw fail(r,'Odeslání '+kk);
+      }
+      state='ok'; meta.last=Date.now(); meta.err=''; tries=0; saveAll();
+    }catch(e){
+      state=(e.status===401||e.status===403||e.status===404)?'badtoken':(navigator.onLine===false||e instanceof TypeError?'offline':'error');
+      meta.err=state==='offline'?'':String(e.message||e); saveAll();
+    }
+    running=false; fire();
+    if(again&&tries<3){again=false;tries++;setTimeout(syncNow,1500);} else again=false;
+  }
+  function soon(ms){clearTimeout(timer);timer=setTimeout(syncNow,ms||2500);}
+  function pend(){return Object.keys(meta.dirty).filter(pushable).length;}
+  function hm(t){var d=new Date(t);return d.getHours()+':'+String(d.getMinutes()).padStart(2,'0');}
+  window.__sync={
+    state:function(){return state;}, pending:pend, last:function(){return meta.last||0;}, error:function(){return meta.err||'';},
+    hasToken:function(){return !!getToken();}, repoName:function(){return REPO.repo;},
+    setToken:function(t){try{localStorage.setItem(TKEY,t);}catch(e){} meta.err=''; syncNow();},
+    clearToken:function(){try{localStorage.removeItem(TKEY);}catch(e){} state='notoken'; fire();},
+    now:function(){syncNow();},
+    label:function(){var p=pend();
+      if(state==='notoken') return 'Synchronizace vypnutá — Export → vlož token'+(p?' · '+p+' čeká':'');
+      if(state==='badtoken') return 'Token nefunguje — Export → Synchronizace';
+      if(state==='offline') return p?'Offline · '+p+' změn čeká v zařízení':'Offline · data v zařízení';
+      if(state==='syncing') return 'Synchronizuji…';
+      if(state==='error') return 'Synchronizace selhala · zkusím znovu'+(p?' · '+p+' čeká':'');
+      if(state==='ok') return p?'Odesílám '+p+'…':'Synchronizováno '+(meta.last?hm(meta.last):'');
+      return p?p+' změn čeká':'Data v zařízení';}
+  };
   var db={
     collection:function(c){return {onSnapshot:function(n){var f=function(){n(cs(c));};subs.push(f);setTimeout(f,0);return function(){};},doc:function(i){return db.doc(c+'/'+i);}};},
     doc:function(p){var a=p.split('/'),c=a[0],i=a[1];store[c]=store[c]||{};
       return {id:i,path:p,
-        set:function(d){store[c][i]=cl(d);save();fire();return Promise.resolve();},
+        set:function(d){store[c][i]=cl(d); if(pushable(p)){meta.dirty[p]=++meta.seq; soon();} saveAll();fire();return Promise.resolve();},
         get:function(){return Promise.resolve(ds(c,i));},
-        delete:function(){delete store[c][i];save();fire();return Promise.resolve();},
+        delete:function(){delete store[c][i];saveAll();fire();return Promise.resolve();},
         onSnapshot:function(n){var f=function(){n(ds(c,i));};subs.push(f);setTimeout(f,0);return function(){};}};}
   };
-  window.addEventListener('storage',function(e){if(e.key===KEY){try{var s2=JSON.parse(e.newValue||'{}');Object.keys(s2).forEach(function(k){store[k]=s2[k];});fire();}catch(x){}}});
+  window.addEventListener('online',function(){soon(500);});
+  window.addEventListener('offline',function(){state=getToken()?'offline':'notoken';fire();});
+  document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible') soon(300);});
+  setInterval(function(){if(document.visibilityState==='visible') syncNow();},60000);
+  setTimeout(syncNow,600);
   window.claude={use:function(n){return Promise.resolve(n==='db'?db:null);}};
   try{if(navigator.storage&&navigator.storage.persist) navigator.storage.persist();}catch(e){}
   if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('./sw.js').catch(function(){});});}
@@ -429,7 +537,7 @@ function setStatus(){
   else if(S.dbState==='slow'){t='Data se zatím nedaří načíst';warn=true;}
   else if(S.dbState==='none'){t='Úložiště není dostupné — změny se neuloží';warn=true;}
   else if(S.dbState==='revoked'){t='Přístup k datům skončil — obnov stránku';warn=true;}
-  else if(MODE==='local'){t=anyDirty()?'Ukládám…':'Uloženo v telefonu';}
+  else if(MODE==='local'){var sy=window.__sync; if(sy){t=sy.label(); warn=['notoken','badtoken','error'].indexOf(sy.state())>=0;} else t=anyDirty()?'Ukládám…':'Uloženo v telefonu';}
   else if(S.offline&&anyDirty()){t='Offline · zápis je v telefonu, odešle se po připojení';warn=true;}
   else if(S.offline){t='Offline · plán je načtený';}
   else if(S.saveErr){t='Neodesláno · zápis je v telefonu, zkouším znovu';warn=true;}
@@ -485,7 +593,7 @@ function flush(date){
   });
 }
 function typing(){var a=document.activeElement;return a&&(a.tagName==='TEXTAREA'||a.tagName==='INPUT'||a.tagName==='SELECT');}
-function softRender(){ if(typing()){S.pending=true;} else render(); }
+function softRender(){ if(typing()){S.pending=true;setStatus();} else render(); }
 function start(){
   render();
   if(!(window.claude&&window.claude.use)){
@@ -530,7 +638,7 @@ function start(){
 
 /* ---------- render ---------- */
 function tabsHtml(){
-  return [['dnes','Dnes'],['tyden','Týden'],['export',MODE==='local'?'Přenos':'Export']].map(function(t){
+  return [['dnes','Dnes'],['tyden','Týden'],['export','Export']].map(function(t){
     return '<button type="button" data-act="tab" data-tab="'+t[0]+'"'+(S.tab===t[0]?' aria-current="page"':'')+'>'+t[1]+'</button>';
   }).join('');
 }
@@ -540,10 +648,12 @@ function render(){
   var w=curWeek(), now=$('#now');
   if(w&&w.mc){now.hidden=false;now.textContent=w.mc+' · týden '+(w.mcWeek||'?');} else now.hidden=true;
   var v=$('#view');
+  var banner=MODE==='cloud'?'<div class="notice" style="margin-bottom:12px;border-color:var(--crit)"><b>Hlavní appka je teď</b> <a href="'+esc(OFFLINE_URL)+'">'+esc(OFFLINE_URL)+'</a> (mobil i PC, synchronizace přes GitHub). Tahle verze na claude.ai se už neaktualizuje — nezapisuj sem.</div>':'';
   if(S.dbState==='loading'&&!weekIds().length) v.innerHTML='<div class="notice">Načítám plán…</div>';
   else if(S.edit&&S.tab==='tyden') v.innerHTML=editView();
-  else if(!weekIds().length) v.innerHTML=MODE==='local'?localSyncView(true):emptyHtml();
+  else if(!weekIds().length) v.innerHTML=MODE==='local'?'<div class="stack">'+syncCardHtml(true)+(window.__sync&&window.__sync.hasToken()?'<div class="notice">Stahuji plán z GitHubu…</div>':'')+'</div>':emptyHtml();
   else v.innerHTML=S.tab==='tyden'?weekView():S.tab==='export'?exportView():todayView();
+  if(banner) v.insertAdjacentHTML('afterbegin',banner);
   renderPad(); setStatus();
 }
 function emptyHtml(){
@@ -668,7 +778,7 @@ function layersGrid(w){
         return;
       }
       var l=getLayer(d,k), it=listItem(k,l.pick);
-      if(MODE==='local'){
+      if(false){
         h+='<div class="lc'+row+'">'+cap+(it?'<b class="small">'+esc(it.label)+'</b>':(l.pick?'<b class="small">'+esc(l.pick)+'</b>':'<span class="muted small">—</span>'))+
           (it&&it.how?'<span class="how">'+esc(it.how)+'</span>':'')+(l.note?'<span class="how">'+md(l.note)+'</span>':'')+'</div>';
         return;
@@ -817,14 +927,14 @@ function weekView(){
   var w=curWeek(); if(S.edit) return editView();
   var ids=weekIds(), isLast=ids[ids.length-1]===w.id;
   var h=weekBar()+'<div class="stack"><section class="card wk-head"><div class="row"><span class="pill ok">'+esc((w.mc||'MC ?')+' · týden '+(w.mcWeek||'?'))+'</span>'+
-    '<span class="spacer"></span>'+(MODE==='local'?'<span class="small muted">Plán upravuješ v appce na PC</span>':'<button type="button" class="btn" data-act="edit">Upravit plán</button>')+'</div><dl class="kv">'+
+    '<span class="spacer"></span>'+'<button type="button" class="btn" data-act="edit">Upravit plán</button>'+'</div><dl class="kv">'+
     '<dt>Progrese</dt><dd>volume <code>'+esc(w.intentVolume||'—')+'</code> · heavy <code>'+esc(w.intentHeavy||'—')+'</code>'+(w.third?' · 3. den '+esc(w.third):'')+'</dd>'+
     [['focus','Focus týdne'],['extra','Extra'],['affect','Co může ovlivnit trénink'],['notes','Z poznámek'],['reminder','Připomínka']].map(function(f){
       return w[f[0]]?'<dt>'+f[1]+'</dt><dd class="txt">'+md(w[f[0]])+'</dd>':'';}).join('')+'</dl></section>';
   h+='<div class="cols">'+(w.days||[]).filter(function(d){return d.kind==='workout';}).map(function(d){return dayCard(d,w);}).join('')+'</div>';
   h+=layersGrid(w)+microHtml();
   if(w.paper) h+='<section class="card"><div class="label" style="margin-bottom:6px">Na papír (B5)</div><pre>'+esc(w.paper)+'</pre></section>';
-  if(isLast&&MODE!=='local') h+='<div><button type="button" class="btn ghost" data-act="newweek">Založit další týden z tohoto</button></div>';
+  if(isLast) h+='<div><button type="button" class="btn ghost" data-act="newweek">Založit další týden z tohoto</button></div>';
   if(S.msg) h+='<div class="small muted">'+esc(S.msg)+'</div>';
   return h+'</div>';
 }
@@ -918,7 +1028,8 @@ function exportDays(){
   return out;
 }
 function exportView(){
-  if(MODE==='local') return localSyncView(false);
+  if(MODE==='local') return '<div class="stack">'+syncCardHtml(false)+excelView()+
+    '<details class="card"><summary>Ruční přenos (záloha, když synchronizace nejde)</summary><div style="margin-top:10px">'+localSyncView(false)+'</div></details></div>';
   return '<div class="stack">'+excelView()+cloudOfflineHtml()+'</div>';
 }
 /* ---------- přenos appka ↔ offline verze (Kopírovat → Vložit) ---------- */
@@ -958,6 +1069,22 @@ function cloudOfflineHtml(){
     '<textarea id="b-plan" readonly style="font-size:11px;min-height:70px" '+(S.showBundle==='b-plan'?'':'hidden')+'>'+esc(pb)+'</textarea>'+
     '<label class="fld" for="b-in">Vložit zápis z offline verze<textarea id="b-in" placeholder="sem vlož text, který začíná FITNESS-BALIK zapis"></textarea></label>'+
     '<div class="row"><button type="button" class="btn" data-act="b-import-logs">Uložit zápis</button><span class="small">'+esc(S.msg3||'')+'</span></div></section>';
+}
+function syncCardHtml(first){
+  var sy=window.__sync; if(!sy) return '';
+  var last=sy.last()?new Date(sy.last()).toLocaleString('cs-CZ',{day:'numeric',month:'numeric',hour:'2-digit',minute:'2-digit'}):'zatím ne';
+  var h='<section class="card stack" style="gap:10px"><div class="label">🔄 Synchronizace · GitHub '+esc(sy.repoName())+'</div>'+
+    '<div class="small"><b>'+esc(sy.label())+'</b> · naposledy '+esc(last)+(sy.pending()?' · čeká '+sy.pending():'')+'</div>';
+  if(sy.hasToken()){
+    h+='<div class="row"><button type="button" class="btn primary" data-act="sync-now">Synchronizovat teď</button>'+
+       '<button type="button" class="btn danger" data-act="tok-clear">'+(S.confirmClear?'Opravdu odpojit?':'Odpojit token')+'</button></div>';
+  } else {
+    h+=(first?'<div class="small">Vlož přístupový token z GitHubu a appka si stáhne plán a zápisy. Pak už se všechno synchronizuje samo, jakmile je internet.</div>':'')+
+       '<label class="fld" for="tok">Přístupový token (začíná github_pat_)<input type="password" id="tok" autocomplete="off" spellcheck="false" placeholder="github_pat_…"></label>'+
+       '<div class="row"><button type="button" class="btn primary" data-act="tok-save">Uložit a synchronizovat</button></div>';
+  }
+  if(sy.error()) h+='<div class="small" style="color:var(--crit)">'+esc(sy.error())+'</div>';
+  return h+'<div class="small muted">Token zůstává jen v tomhle zařízení (mobil a PC zvlášť). Bez internetu se zápis drží v zařízení a odešle se sám po připojení.</div></section>';
 }
 function localSyncView(empty){
   var logs=Object.keys(S.logs).map(function(d){return S.logs[d];}).filter(hasReps), lb=bundleText('zapis',{logs:logs});
@@ -1062,6 +1189,10 @@ document.addEventListener('click',function(ev){
   if(a==='copy'){var all=[];exportDays().forEach(function(x){all=all.concat(x.rows);}); var text=toTSV(all,S.xhead);
     var done=function(ok){S.msg=ok?'Zkopírováno. Vlož do Excelu (Ctrl+V).':'Kopírování tu nejde — označ text níž a zkopíruj ručně.';S.showTsv=!ok;render(); if(!ok){var ta=$('#tsv'); if(ta){ta.focus();ta.select();}}};
     try{navigator.clipboard.writeText(text).then(function(){done(true);},function(){done(false);});}catch(e){done(false);} return;}
+  if(a==='tok-save'){var tv=(($('#tok')||{}).value||'').trim(); if(!/^(github_pat_|ghp_)/.test(tv)){var el=$('#tok'); if(el){el.setCustomValidity('Token začíná github_pat_');el.reportValidity&&el.reportValidity();} return;}
+    window.__sync.setToken(tv); render(); return;}
+  if(a==='tok-clear'){if(!S.confirmClear){S.confirmClear=true;render();return;} S.confirmClear=false; window.__sync.clearToken(); render(); return;}
+  if(a==='sync-now'){window.__sync.now(); render(); return;}
   if(a==='b-copy-plan'){copyText(bundleText('plan',planBundle()),'Plán zkopírovaný. Otevři offline verzi → Přenos → Vložit plán.','b-plan');return;}
   if(a==='b-copy-logs'){var lgs=Object.keys(S.logs).map(function(d){return S.logs[d];}).filter(hasReps);
     copyText(bundleText('zapis',{logs:lgs}),'Zápis zkopírovaný. V appce: Export → Vložit zápis.','b-logs');return;}
