@@ -1,6 +1,6 @@
 {
- "name": "Fitness",
- "short_name": "Fitness",
+ "name": "Fitness app",
+ "short_name": "Fitness app",
  "start_url": "./",
  "scope": "./",
  "display": "standalone",
